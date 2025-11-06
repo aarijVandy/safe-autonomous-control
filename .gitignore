@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+*.egg
+MANIFEST
+
+
+venv/
+.venv/
+ENV/
+env/
+.env
+
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+
+checkpoints/
+
+# Data
+data/
+Data/
+results/
+*.csv
+*.h5
+*.hdf5
+
+# OpenSpec files (planning/documentation)
+AGENTS.md
+IMPLEMENTATION_PLAN.md
+SCOPE_COMPARISON.md
+STREAMLINED_IMPLEMENTATION_PLAN.md
+STREAMLINED_PLAN.py
+ENVIRONMENT_SETUP_ANALYSIS.md
+SETUP_COMPLETE.md
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# OS
+Thumbs.db
+.DS_Store
