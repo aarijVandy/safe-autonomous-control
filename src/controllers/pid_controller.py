@@ -20,6 +20,9 @@ class PIDController(BaseController):
         [2] time_to_collision: TTC (s)
         [3] ego_velocity: Current vehicle speed (m/s)
         [4] lane_occupancy: Adjacent lane status (0 or 1)
+        [5] right_vehicle_distance: Longitudinal distance to right-side vehicle (m)
+        [6] right_vehicle_rel_velocity: Relative velocity to right-side vehicle (m/s)
+        [7] right_vehicle_lateral_dist: Lateral distance to right-side vehicle (m)
     
     Action space:
         [0] acceleration: Control signal in [-3.0, 2.0] m/s²
@@ -62,6 +65,11 @@ class PIDController(BaseController):
         self.min_ttc = min_ttc
         self.action_limits = action_limits
         
+        # Proximity-based control parameters
+        self.target_ttc_min = 2.0  # Minimum target TTC (seconds)
+        self.target_ttc_max = 4.0  # Maximum target TTC (seconds)
+        self.lateral_safe_distance = 4.0  # One lane width (meters)
+        
         # State variables
         self.prev_error = 0.0
         self.integral_error = 0.0
@@ -98,13 +106,14 @@ class PIDController(BaseController):
         """
         Compute PID control action based on observation.
         
-        The controller uses a cascaded approach:
-        1. Safety check: If TTC is low or distance is small, brake
-        2. Following mode: Maintain safe distance from lead vehicle
-        3. Cruising mode: Maintain target speed if no lead vehicle
+        The controller uses a proximity-based cascaded approach:
+        1. Priority 1 (Right-side vehicle): If vehicle on right within 1 lane, maintain lateral separation
+        2. Priority 2 (Front vehicle): If vehicle ahead, maintain TTC in [2,4] seconds
+        3. Priority 3 (Default): Maintain target speed (cruising mode)
         
         Args:
-            observation: [relative_distance, relative_velocity, ttc, ego_velocity, lane_occupancy]
+            observation: [relative_distance, relative_velocity, ttc, ego_velocity, lane_occupancy,
+                         right_vehicle_distance, right_vehicle_rel_velocity, right_vehicle_lateral_dist]
             info: Additional information (optional)
         
         Returns:
@@ -116,29 +125,85 @@ class PIDController(BaseController):
         ttc = observation[2]
         ego_velocity = observation[3]
         
-        # Determine control mode
+        # Parse right-side vehicle information
+        right_veh_distance = observation[5]
+        right_veh_rel_velocity = observation[6]
+        right_veh_lateral_dist = observation[7]
+        
+        # Determine control mode based on proximity
         has_lead_vehicle = relative_distance < 100.0  # Lead vehicle exists
+        has_right_vehicle = right_veh_lateral_dist < 5.0  # Right vehicle within ~1 lane
         
-        # SAFETY OVERRIDE: Emergency braking if TTC is too low
-        if has_lead_vehicle and ttc < self.min_ttc and relative_velocity < 0:
-
-            error = relative_distance - self.safe_distance
-            action = -2.5 if error < 0 else -1.5
-            self.metrics["ttc_violations"] += 1
-        
-        # FOLLOWING MODE: Maintain safe distance from lead vehicle
-        elif has_lead_vehicle:
-
-            desired_distance = max(self.safe_distance, ego_velocity * 2.0)
-            distance_error = relative_distance - desired_distance
+        # PRIORITY 1: LATERAL SEPARATION MODE - Maintain distance from right-side vehicle
+        if has_right_vehicle:
+            # Vehicle detected on the right side within 1 lane distance
+            # Adjust speed to maintain safe lateral separation
             
-            # consider relative velocity
-            velocity_error = relative_velocity
-            error = distance_error + 0.5 * velocity_error
-            action = self._compute_pid(error)
+            # If right vehicle is ahead and close, slow down to create separation
+            if right_veh_distance > 0 and abs(right_veh_distance) < 20.0:
+                # Vehicle ahead-right: maintain safe separation by matching or slightly reducing speed
+                # Target: keep longitudinal separation to allow merging space
+                desired_separation = 15.0  # meters longitudinal separation
+                separation_error = right_veh_distance - desired_separation
+                
+                # Add relative velocity component for smoother tracking
+                error = separation_error + 0.3 * right_veh_rel_velocity
+                action = self._compute_pid(error)
+                
+            # If right vehicle is behind and close, speed up to create separation
+            elif right_veh_distance < 0 and abs(right_veh_distance) < 20.0:
+                # Vehicle behind-right: speed up to create forward separation
+                speed_increase = 2.0  # m/s above current speed
+                speed_error = (ego_velocity + speed_increase) - ego_velocity
+                error = speed_error
+                action = self._compute_pid(error)
+                
+            # If right vehicle is beside, maintain current speed or slight acceleration
+            else:
+                # Vehicle directly beside: maintain or slightly increase speed
+                error = 1.0  # Small positive error to maintain slight acceleration
+                action = self._compute_pid(error)
         
-        # CRUISING MODE: Maintain target speed
+        # PRIORITY 2: TTC MAINTENANCE MODE - Maintain TTC in [2,4] seconds for front vehicle
+        elif has_lead_vehicle:
+            # Vehicle detected ahead - maintain safe TTC
+            
+            # Calculate desired TTC (target middle of range: 3.0 seconds)
+            target_ttc = 3.0
+            
+            # SAFETY OVERRIDE: Emergency braking if TTC is too low
+            if ttc < self.target_ttc_min and relative_velocity < 0:
+                # Critical: TTC < 2s and approaching
+                error = relative_distance - self.safe_distance
+                action = -2.5 if error < 0 else -1.5
+                self.metrics["ttc_violations"] += 1
+            
+            # TTC is above maximum: can speed up
+            elif ttc > self.target_ttc_max:
+                # TTC > 4s: maintain distance but can increase speed if needed
+                desired_distance = max(self.safe_distance, ego_velocity * 2.5)
+                distance_error = relative_distance - desired_distance
+                
+                # Consider relative velocity for smoother control
+                velocity_error = relative_velocity
+                error = distance_error + 0.5 * velocity_error
+                action = self._compute_pid(error)
+            
+            # TTC is within target range: maintain current following behavior
+            else:
+                # 2s <= TTC <= 4s: maintain this TTC by adjusting speed
+                # Calculate desired distance based on target TTC
+                desired_distance = max(self.safe_distance, ego_velocity * target_ttc)
+                distance_error = relative_distance - desired_distance
+                
+                # PID control on distance with velocity compensation
+                velocity_error = relative_velocity
+                error = distance_error + 0.5 * velocity_error
+                action = self._compute_pid(error)
+        
+        # PRIORITY 3: CRUISING MODE - Maintain target speed
         else:
+            # No vehicles in proximity: cruise at target speed
             speed_error = self.target_speed - ego_velocity
             error = speed_error
             
