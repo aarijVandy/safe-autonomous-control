@@ -29,16 +29,23 @@ class ConstrainedController(BaseController):
                 - dual_learning_rate: Learning rate for Lagrangian multipliers
                 - cost_weights: Weights for different cost components
         """
-        super().__init__(config)
+        # Initialize attributes BEFORE calling super().__init__() 
+        # because BaseController.__init__ calls reset()
         
         # Constraint configuration
         self.constraint_thresholds = config.get('constraint_thresholds', {
-            'ttc_min': 2.0,          # seconds
+            'ttc_min': 1.0,          # seconds
             'headway_s0': 2.0,       # meters
             'headway_T': 1.5,        # seconds
             'clearance_min': 1.5,    # meters
             'jerk_max': 3.0,         # m/s³
-        })
+        }) if config else {
+            'ttc_min': 1.0,
+            'headway_s0': 2.0,
+            'headway_T': 1.5,
+            'clearance_min': 1.5,
+            'jerk_max': 3.0,
+        }
         
         # Lagrangian dual variables (one per constraint)
         self.dual_variables = {
@@ -49,7 +56,7 @@ class ConstrainedController(BaseController):
         }
         
         # Dual learning rate
-        self.dual_lr = config.get('dual_learning_rate', 0.01)
+        self.dual_lr = config.get('dual_learning_rate', 0.005) if config else 0.005
         
         # Cost tracking
         self.episode_costs = {
@@ -67,6 +74,9 @@ class ConstrainedController(BaseController):
             'jerk': 0,
         }
         self.timesteps = 0
+        
+        # Now call parent init (which will call reset())
+        super().__init__(config)
     
     @abstractmethod
     def compute_action(self, observation: np.ndarray, info: Dict[str, Any] = None) -> np.ndarray:
@@ -286,6 +296,207 @@ class ManeuverPolicy(ABC):
         }
 
 
+class RuleBasedManeuverPolicy(ManeuverPolicy):
+    """
+    Rule-based maneuver policy implementing gap acceptance and advantage-to-change logic.
+    
+    Decision logic:
+    1. Check if current lane is blocked (slow lead vehicle)
+    2. Evaluate gap safety in adjacent lanes (TTC-based)
+    3. Compute time advantage for lane changes
+    4. Select maneuver with highest advantage if safe
+    """
+    
+    def __init__(self, config: Dict[str, Any] = None):
+        """
+        Initialize rule-based maneuver policy.
+        
+        Args:
+            config: Configuration including:
+                - target_speed: Desired speed (m/s)
+                - speed_diff_threshold: Minimum speed difference to trigger overtake
+                - ttc_front_threshold: Minimum TTC to front vehicle in target lane
+                - ttc_rear_threshold: Minimum TTC to rear vehicle in target lane
+                - time_advantage_threshold: Minimum time advantage to change lanes
+        """
+        super().__init__(config)
+        
+        # Decision thresholds
+        self.target_speed = config.get('target_speed', 25.0)  # m/s (~90 km/h)
+        self.speed_diff_threshold = config.get('speed_diff_threshold', 3.0)  # m/s
+        self.ttc_front_threshold = config.get('ttc_front_threshold', 3.0)  # seconds
+        self.ttc_rear_threshold = config.get('ttc_rear_threshold', 3.0)  # seconds
+        self.time_advantage_threshold = config.get('time_advantage_threshold', 2.0)  # m/s
+        
+        # Statistics
+        self.lane_change_attempts = 0
+        self.lane_change_rejections = 0
+    
+    def select_maneuver(
+        self, 
+        observation: np.ndarray,
+        info: Dict[str, Any] = None
+    ) -> int:
+        """
+        Select maneuver using rule-based logic.
+        
+        Args:
+            observation: 18-dim observation from NADE environment:
+                [0] lead_rel_distance
+                [1] lead_rel_velocity
+                [2] lead_ttc
+                [3] ego_velocity
+                [4] ego_lane_idx (normalized)
+                [5] ego_lane_offset
+                [6-8] right vehicle (distance, rel_vel, lateral_dist)
+                [9-11] left vehicle (distance, rel_vel, lateral_dist)
+                [12-17] predictions (not used in rule-based policy)
+            info: Additional information
+        
+        Returns:
+            maneuver: Selected maneuver (0-3)
+        """
+        info = info or {}
+        
+        # Extract observation features
+        lead_distance = observation[0]
+        lead_rel_velocity = observation[1]
+        lead_ttc = observation[2]
+        ego_velocity = observation[3]
+        ego_lane_idx_norm = observation[4]
+        
+        right_distance = observation[6]
+        right_rel_velocity = observation[7]
+        
+        left_distance = observation[9]
+        left_rel_velocity = observation[10]
+        
+        # Estimate current lane (denormalize)
+        num_lanes = 3  # NADE default
+        ego_lane = int(ego_lane_idx_norm * (num_lanes - 1))
+        
+        # Check if current lane is blocked
+        is_blocked = False
+        if lead_distance < 100 and lead_distance > 0:  # Lead vehicle present
+            lead_speed = ego_velocity + lead_rel_velocity
+            if lead_speed < (self.target_speed - self.speed_diff_threshold):
+                is_blocked = True
+        
+        # If not blocked, keep lane
+        if not is_blocked:
+            return self.KEEP_LANE
+        
+        # Evaluate lane change options
+        lane_change_options = []
+        
+        # Check right lane (if not in rightmost lane)
+        if ego_lane < (num_lanes - 1):
+            if self._is_gap_safe(right_distance, right_rel_velocity, 'right'):
+                advantage = self._compute_lane_advantage(
+                    right_distance, right_rel_velocity, ego_velocity
+                )
+                if advantage > self.time_advantage_threshold:
+                    lane_change_options.append(('right', self.CHANGE_RIGHT, advantage))
+        
+        # Check left lane (if not in leftmost lane)
+        if ego_lane > 0:
+            if self._is_gap_safe(left_distance, left_rel_velocity, 'left'):
+                advantage = self._compute_lane_advantage(
+                    left_distance, left_rel_velocity, ego_velocity
+                )
+                if advantage > self.time_advantage_threshold:
+                    lane_change_options.append(('left', self.CHANGE_LEFT, advantage))
+        
+        # Select best option
+        if lane_change_options:
+            # Sort by advantage (descending)
+            lane_change_options.sort(key=lambda x: x[2], reverse=True)
+            self.lane_change_attempts += 1
+            return lane_change_options[0][1]  # Return maneuver with highest advantage
+        else:
+            # No safe lane change available, keep lane
+            if is_blocked:
+                self.lane_change_rejections += 1
+            return self.KEEP_LANE
+    
+    def _is_gap_safe(
+        self, 
+        target_lane_distance: float,
+        target_lane_rel_velocity: float,
+        lane_side: str
+    ) -> bool:
+        """
+        Check if gap in target lane is safe for lane change.
+        
+        Args:
+            target_lane_distance: Longitudinal distance to nearest vehicle in target lane
+            target_lane_rel_velocity: Relative velocity with that vehicle
+            lane_side: 'left' or 'right'
+        
+        Returns:
+            is_safe: True if gap is safe
+        """
+        # Check if there's a vehicle in the target lane
+        if abs(target_lane_distance) > 50:  # No vehicle within 50m
+            return True
+        
+        # Vehicle ahead in target lane
+        if target_lane_distance > 0:
+            # Check TTC to front
+            if target_lane_rel_velocity < -0.1:  # Approaching
+                ttc_front = target_lane_distance / abs(target_lane_rel_velocity)
+                if ttc_front < self.ttc_front_threshold:
+                    return False
+        
+        # Vehicle behind in target lane
+        else:
+            # Check TTC to rear
+            if target_lane_rel_velocity > 0.1:  # Vehicle catching up
+                ttc_rear = abs(target_lane_distance) / target_lane_rel_velocity
+                if ttc_rear < self.ttc_rear_threshold:
+                    return False
+        
+        return True
+    
+    def _compute_lane_advantage(
+        self,
+        target_lane_distance: float,
+        target_lane_rel_velocity: float,
+        ego_velocity: float
+    ) -> float:
+        """
+        Compute time advantage of changing to target lane.
+        
+        Args:
+            target_lane_distance: Distance to lead vehicle in target lane
+            target_lane_rel_velocity: Relative velocity with lead vehicle
+            ego_velocity: Ego velocity
+        
+        Returns:
+            advantage: Speed advantage (m/s) in target lane
+        """
+        # If no vehicle ahead in target lane, advantage is difference to target speed
+        if target_lane_distance > 50:
+            return self.target_speed - ego_velocity
+        
+        # Otherwise, advantage is speed of lead vehicle in target lane
+        lead_speed_target_lane = ego_velocity + target_lane_rel_velocity
+        advantage = lead_speed_target_lane - ego_velocity
+        
+        return max(0.0, advantage)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics including lane change attempts and rejections."""
+        stats = super().get_stats()
+        stats['lane_change_attempts'] = self.lane_change_attempts
+        stats['lane_change_rejections'] = self.lane_change_rejections
+        if self.lane_change_attempts > 0:
+            stats['lane_change_success_rate'] = (
+                1.0 - self.lane_change_rejections / self.lane_change_attempts
+            )
+        return stats
+
+
 class HierarchicalController(ConstrainedController):
     """
     Hierarchical controller that coordinates maneuver and trajectory policies.
@@ -309,12 +520,13 @@ class HierarchicalController(ConstrainedController):
             trajectory_policy: Low-level trajectory policy
             config: Configuration dictionary
         """
-        super().__init__(config)
-        
+        # Initialize attributes BEFORE calling super().__init__() 
+        # because it will call reset()
         self.maneuver_policy = maneuver_policy
         self.trajectory_policy = trajectory_policy
         
         # Update frequencies
+        config = config or {}
         self.maneuver_freq = config.get('maneuver_frequency', 1.0)  # Hz
         self.trajectory_freq = config.get('trajectory_frequency', 10.0)  # Hz
         
@@ -322,6 +534,9 @@ class HierarchicalController(ConstrainedController):
         self.dt = 1.0 / self.trajectory_freq
         self.maneuver_dt = 1.0 / self.maneuver_freq
         self.time_since_maneuver_update = 0.0
+        
+        # Now call parent init (which will call reset())
+        super().__init__(config)
     
     def compute_action(self, observation: np.ndarray, info: Dict[str, Any] = None) -> np.ndarray:
         """
