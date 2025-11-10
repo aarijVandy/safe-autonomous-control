@@ -128,8 +128,9 @@ class NADEHighwayEnv(gym.Env):
         }
         
         # Vehicle spawning parameters for continuous traffic generation
-        self.spawn_interval = 50  # Spawn new vehicles every 50 steps (5 seconds at 10Hz)
-        self.max_vehicles = vehicles_count  # Maintain target vehicle count
+        self.spawn_interval = 150  # Spawn new vehicles every 150 steps (15 seconds at 10Hz)
+        self.initial_vehicle_count = vehicles_count  # Initial vehicle count to spawn each time
+        self.max_total_vehicles = vehicles_count * 3  # Maximum total vehicles allowed (to prevent overcrowding)
         self.steps_since_last_spawn = 0
     
     def _create_base_env(self, config: Optional[Dict[str, Any]] = None):
@@ -328,27 +329,53 @@ class NADEHighwayEnv(gym.Env):
         Spawn new vehicles to maintain traffic density throughout the simulation.
         This ensures continuous traffic flow rather than just initial vehicle generation.
         Vehicles are spawned at 60 kph (16.67 m/s) with small variations.
+        
+        Every 150 timesteps, spawns the same number of vehicles as the initial vehicle count
+        to maintain consistent traffic density throughout the episode.
+        Also removes vehicles that are too far from ego to prevent accumulation.
         """
-        # Check if it's time to spawn and if we're below max vehicle count
+        # Check if it's time to spawn
         if self.steps_since_last_spawn < self.spawn_interval:
             return
         
         # Reset spawn counter
         self.steps_since_last_spawn = 0
         
-        # Count current vehicles (excluding ego)
+        # Get ego vehicle
         ego = self.env.unwrapped.vehicle
         if ego is None:
             return
+        
+        road = self.env.unwrapped.road
+        
+        # Clean up vehicles that are too far from ego (>250m behind or >300m ahead)
+        # This prevents vehicle accumulation and maintains consistent traffic density
+        # Note: We use a smaller distance for removal to ensure we don't remove visible traffic
+        vehicles_to_remove = []
+        for vehicle in road.vehicles:
+            if vehicle == ego:
+                continue
             
-        current_vehicles = [v for v in self.env.unwrapped.road.vehicles if v != ego]
+            longitudinal_distance = vehicle.position[0] - ego.position[0]
+            
+            # Remove vehicles that are too far behind or ahead
+            # These thresholds ensure vehicles are only removed when truly out of range
+            if longitudinal_distance < -250.0 or longitudinal_distance > 300.0:
+                vehicles_to_remove.append(vehicle)
         
-        # Only spawn if below target count
-        if len(current_vehicles) >= self.max_vehicles:
-            return
+        # Remove far-away vehicles
+        for vehicle in vehicles_to_remove:
+            try:
+                road.vehicles.remove(vehicle)
+            except ValueError:
+                # Vehicle already removed, skip
+                pass
         
-        # Calculate how many vehicles to spawn (1-3 at a time)
-        vehicles_needed = min(3, self.max_vehicles - len(current_vehicles))
+        # Count current vehicles (excluding ego)
+        current_vehicles = [v for v in road.vehicles if v != ego]
+        
+        # Spawn the same number as initial vehicle count
+        vehicles_needed = self.initial_vehicle_count
         
         try:
             # Import vehicle classes
@@ -362,16 +389,17 @@ class NADEHighwayEnv(gym.Env):
                 # Choose a random lane
                 lane_idx = np.random.randint(0, self.num_lanes)
                 
-                # Alternate spawning ahead and behind
+                # Alternate spawning ahead and behind for better distribution
                 if i % 2 == 0:
-                    # Spawn ahead of ego vehicle (80-150m ahead)
-                    spawn_distance = ego.position[0] + np.random.uniform(80, 150)
+                    # Spawn ahead of ego vehicle (100-200m ahead)
+                    spawn_distance = ego.position[0] + np.random.uniform(100, 200)
                 else:
-                    # Spawn behind ego vehicle (50-100m behind)
-                    spawn_distance = ego.position[0] - np.random.uniform(50, 100)
+                    # Spawn behind ego vehicle (80-150m behind)
+                    spawn_distance = ego.position[0] - np.random.uniform(80, 150)
                 
-                # Target speed: 60 kph (16.67 m/s) with ±2 m/s variation
-                target_speed = np.random.uniform(14.67, 18.67)  # 53-67 kph
+                # Target speed: 60 kph (16.67 m/s) with minimal variation to maintain speed
+                # Tighter range to prevent speed decay
+                target_speed = np.random.uniform(16.0, 17.3)  # 57.6-62.3 kph
                 
                 # Get the lane
                 try:
@@ -383,14 +411,19 @@ class NADEHighwayEnv(gym.Env):
                         speed=target_speed,
                     )
                     
-                    # Set IDM parameters for 60 kph driving
+                    # Set IDM parameters for consistent 60 kph driving behavior
+                    # These parameters ensure spawned vehicles maintain their speed
                     new_vehicle.target_speed = target_speed
                     if hasattr(new_vehicle, 'COMFORT_ACC_MAX'):
-                        new_vehicle.COMFORT_ACC_MAX = 1.0
+                        new_vehicle.COMFORT_ACC_MAX = 1.0  # Comfortable acceleration
                     if hasattr(new_vehicle, 'COMFORT_ACC_MIN'):
-                        new_vehicle.COMFORT_ACC_MIN = -2.0
+                        new_vehicle.COMFORT_ACC_MIN = -2.0  # Comfortable braking
                     if hasattr(new_vehicle, 'TIME_WANTED'):
-                        new_vehicle.TIME_WANTED = 1.5
+                        new_vehicle.TIME_WANTED = 1.5  # Desired time headway (seconds)
+                    if hasattr(new_vehicle, 'DELTA'):
+                        new_vehicle.DELTA = 4.0  # Acceleration exponent
+                    if hasattr(new_vehicle, 'DESIRED_VELOCITY'):
+                        new_vehicle.DESIRED_VELOCITY = 16.67  # 60 kph in m/s
                     
                     # Check if spawn position is safe (no collision with existing vehicles)
                     safe_spawn = True
