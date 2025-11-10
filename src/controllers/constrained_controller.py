@@ -322,7 +322,7 @@ class RuleBasedManeuverPolicy(ManeuverPolicy):
         super().__init__(config)
         
         # Decision thresholds
-        self.target_speed = config.get('target_speed', 25.0)  # m/s (~90 km/h)
+        self.target_speed = config.get('target_speed', 19.44)  # m/s (~70 km/h)
         self.speed_diff_threshold = config.get('speed_diff_threshold', 3.0)  # m/s
         self.ttc_front_threshold = config.get('ttc_front_threshold', 3.0)  # seconds
         self.ttc_rear_threshold = config.get('ttc_rear_threshold', 3.0)  # seconds

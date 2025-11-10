@@ -73,13 +73,8 @@ class HierarchicalTrainer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create environment
         self.env = create_nade_env(**env_config)
-        
-        # Create hierarchical controller
         self.controller = self._create_controller()
-        
-        # TensorBoard writer
         run_name = f"hierarchical_sac_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.writer = SummaryWriter(log_dir=str(self.log_dir / run_name))
         
@@ -380,7 +375,7 @@ def main():
     # Controller configuration
     controller_config = {
         'maneuver_policy': {
-            'target_speed': 25.0,
+            'target_speed': 19.44,  # 70 km/h
             'speed_diff_threshold': 3.0,
             'ttc_front_threshold': 3.0,
             'ttc_rear_threshold': 3.0,
@@ -405,12 +400,15 @@ def main():
                 'jerk_max': 3.0,
             },
             # Dual learning
-            'dual_learning_rate': 0.01,
-            # Reward weights
-            'w_speed': 1.0,
-            'w_lane': 0.5,
-            'w_progress': 0.2,
-            'w_comfort': 0.1,
+            'dual_learning_rate': 0.005,  # Reduced for more stable learning
+            # Reward weights (rebalanced)
+            'w_speed': 2.0,
+            'w_lane': 0.3,
+            'w_progress': 1.0,
+            'w_comfort': 0.05,
+            # Exploration
+            'exploration_bonus': True,
+            'exploration_decay': 0.9999,
         },
         'hierarchical': {
             'maneuver_frequency': 1.0,  # Hz

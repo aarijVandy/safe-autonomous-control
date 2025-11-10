@@ -7,7 +7,7 @@ NORMAL_CONFIG = {
     "name": "normal",
     "adversarial_mode": False,
     "vehicles_count": 15,
-    "duration": 40.0,
+    "duration": 100.0,  
     "description": "Normal highway traffic with cooperative IDM vehicles",
 }
 
@@ -17,7 +17,7 @@ MILD_ADVERSARIAL_CONFIG = {
     "adversarial_mode": True,
     "adversarial_intensity": 0.3,
     "vehicles_count": 20,
-    "duration": 40.0,
+    "duration": 100.0,  
     "description": "Mildly adversarial traffic with occasional aggressive behaviors",
 }
 
@@ -27,7 +27,7 @@ MODERATE_ADVERSARIAL_CONFIG = {
     "adversarial_mode": True,
     "adversarial_intensity": 0.5,
     "vehicles_count": 20,
-    "duration": 40.0,
+    "duration": 100.0,
     "description": "Moderately adversarial traffic with frequent aggressive behaviors",
 }
 
@@ -37,7 +37,7 @@ SEVERE_ADVERSARIAL_CONFIG = {
     "adversarial_mode": True,
     "adversarial_intensity": 0.8,
     "vehicles_count": 25,
-    "duration": 40.0,
+    "duration": 100.0,  
     "description": "Severely adversarial traffic with very frequent aggressive behaviors",
 }
 

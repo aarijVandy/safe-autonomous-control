@@ -44,7 +44,7 @@ class RewardConfig:
     w_accel: float = 0.05         # Acceleration penalty weight
     
     # Target parameters
-    v_target: float = 27.0        # Target velocity (m/s)
+    v_target: float = 19.5       # Target velocity (m/s) - 70 km/h
     v_min: float = 15.0           # Minimum velocity (m/s)
     v_max: float = 35.0           # Maximum velocity (m/s)
     

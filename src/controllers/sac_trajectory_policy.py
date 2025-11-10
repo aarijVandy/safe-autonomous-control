@@ -288,25 +288,29 @@ class SACTrajectoryPolicy(ConstrainedController):
         self.training_mode = True
         self.updates = 0
         
-        # Reward shaping parameters
-        self.w_speed = config.get('w_speed', 1.0)
-        self.w_lane = config.get('w_lane', 0.5)
-        self.w_progress = config.get('w_progress', 0.2)
-        self.w_comfort = config.get('w_comfort', 0.1)
+        # Reward shaping parameters (rebalanced for better learning)
+        self.w_speed = config.get('w_speed', 2.0)        # Increased for stronger signal
+        self.w_lane = config.get('w_lane', 0.3)          # Reduced, less critical
+        self.w_progress = config.get('w_progress', 1.0)  # Increased to encourage progress
+        self.w_comfort = config.get('w_comfort', 0.05)   # Reduced, comfort is secondary
+        
+        # Exploration bonus parameters
+        self.exploration_bonus_enabled = config.get('exploration_bonus', True)
+        self.exploration_decay = config.get('exploration_decay', 0.9999)
         
         # Previous state for jerk computation
         self.prev_action = None
     
     def compute_action(self, observation: np.ndarray, info: Dict[str, Any] = None) -> np.ndarray:
         """
-        Compute action using current policy with safety-aware modifications.
+        Compute action using current policy.
         
         Args:
             observation: Current observation
             info: Additional information
         
         Returns:
-            action: Control action (with safety overrides if needed)
+            action: Control action
         """
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
         
@@ -316,68 +320,14 @@ class SACTrajectoryPolicy(ConstrainedController):
                 action, _ = self.actor.sample(obs_tensor)
             action = action.cpu().numpy()[0]
         else:
-            # Use deterministic policy (mean)
+            # Use deterministic policy (mean) - no bias, trust the learned policy
             with torch.no_grad():
                 mean, _ = self.actor.forward(obs_tensor)
                 action = torch.tanh(mean) * self.actor.action_scale + self.actor.action_bias
             action = action.cpu().numpy()[0]
         
-        # Safety-aware action modification
-        action = self._apply_safety_override(observation, action)
-        
         # Clip to valid range
         action = np.clip(action, -3.0, 2.0)
-        
-        return action
-    
-    def _apply_safety_override(self, observation: np.ndarray, action: np.ndarray) -> np.ndarray:
-        """
-        Apply emergency braking or deceleration when safety constraints are violated.
-        
-        Args:
-            observation: Current observation
-            action: Proposed action from policy
-        
-        Returns:
-            modified_action: Potentially modified action for safety
-        """
-        lead_distance = observation[0]
-        lead_rel_velocity = observation[1]
-        ttc = observation[2]
-        ego_velocity = observation[3]
-        
-        # Safety thresholds
-        ttc_critical = 1.0  # Critical TTC threshold (below 1s = emergency)
-        ttc_warning = 1.5   # Warning TTC threshold (below 1.5s = caution)
-        headway_s0 = self.constraint_thresholds['headway_s0']
-        headway_T = self.constraint_thresholds['headway_T']
-        
-        # Check if lead vehicle exists and is close
-        if lead_distance < 100 and lead_distance > 0:
-            desired_headway = headway_s0 + headway_T * ego_velocity
-            headway_ratio = lead_distance / max(desired_headway, 1.0)
-            
-            # Emergency braking: Critical TTC or severe headway violation
-            if ttc < ttc_critical or headway_ratio < 0.5:
-                # Force maximum braking
-                brake_intensity = -3.0
-                action[0] = min(action[0], brake_intensity)
-            
-            # Moderate braking: Warning TTC or moderate headway violation
-            elif ttc < ttc_warning or headway_ratio < 0.7:
-                # Force moderate braking (interpolate based on severity)
-                if ttc < ttc_warning:
-                    ttc_factor = (ttc_warning - ttc) / (ttc_warning - ttc_critical)
-                else:
-                    ttc_factor = (0.7 - headway_ratio) / 0.2
-                
-                brake_intensity = -1.5 * ttc_factor - 0.5  # Range: -0.5 to -2.0 m/s²
-                action[0] = min(action[0], brake_intensity)
-            
-            # Gentle deceleration: Approaching safety limits
-            elif ttc < 2.0 or headway_ratio < 0.9:
-                # Prevent acceleration, only allow coast or gentle brake
-                action[0] = min(action[0], 0.0)
         
         return action
     
@@ -417,7 +367,7 @@ class SACTrajectoryPolicy(ConstrainedController):
         if lead_distance < 100 and lead_distance > 0:  # Lead vehicle present
             if ttc < tau_min:
                 violation = tau_min - ttc
-                costs['ttc'] = violation ** 2  # Quadratic barrier function
+                costs['ttc'] = violation  # Linear barrier function
             else:
                 costs['ttc'] = 0.0
         else:
@@ -427,10 +377,10 @@ class SACTrajectoryPolicy(ConstrainedController):
         s_0 = self.constraint_thresholds['headway_s0']
         T_h = self.constraint_thresholds['headway_T']
         if lead_distance < 100 and lead_distance > 0:
-            desired_headway = s_0 +  ego_velocity
+            desired_headway = s_0 + T_h * ego_velocity
             if lead_distance < desired_headway:
                 violation = desired_headway - lead_distance
-                costs['headway'] = violation ** 2
+                costs['headway'] = violation  # Linear barrier function
             else:
                 costs['headway'] = 0.0
         else:
@@ -449,7 +399,7 @@ class SACTrajectoryPolicy(ConstrainedController):
             clearance_violations.append(d_min - left_lateral)
         
         if clearance_violations:
-            costs['clearance'] = sum(v ** 2 for v in clearance_violations)
+            costs['clearance'] = sum(clearance_violations)  # Linear barrier function
         else:
             costs['clearance'] = 0.0
         
@@ -460,7 +410,7 @@ class SACTrajectoryPolicy(ConstrainedController):
             jerk = (action[0] - self.prev_action[0]) / dt
             if abs(jerk) > j_max:
                 violation = abs(jerk) - j_max
-                costs['jerk'] = violation ** 2
+                costs['jerk'] = violation  # Linear barrier function
             else:
                 costs['jerk'] = 0.0
         else:
@@ -477,7 +427,7 @@ class SACTrajectoryPolicy(ConstrainedController):
     
     def compute_reward(self, observation: np.ndarray, action: np.ndarray) -> float:
         """
-        Compute shaped reward using potential functions.
+        Compute shaped reward using potential functions with safety recovery bonuses.
         
         Args:
             observation: Current observation
@@ -486,25 +436,72 @@ class SACTrajectoryPolicy(ConstrainedController):
         Returns:
             reward: Shaped reward value
         """
+        # Extract features
+        lead_distance = observation[0]
+        lead_rel_velocity = observation[1]
+        ttc = observation[2]
         ego_velocity = observation[3]
         lane_offset = observation[5]
         
-        # Speed tracking reward (potential-based)
-        target_speed = 25.0  # m/s
-        speed_error = (ego_velocity - target_speed) ** 2
-        r_speed = -self.w_speed * speed_error
+        # Speed tracking reward (use linear error for better scaling)
+        target_speed = 16.67  # m/s (60 km/h) - matching traffic speed
+        speed_error = abs(ego_velocity - target_speed)
+        # Use smooth reward: r = -w * |error| for |error| > 1, else -w * error^2 
+        if speed_error > 1.0:
+            r_speed = -self.w_speed * speed_error
+        else:
+            r_speed = -self.w_speed * (speed_error ** 2)
         
         # Lane centering reward (potential-based)
         r_lane = -self.w_lane * (lane_offset ** 2)
         
-        # Progress reward (encourage forward motion)
-        r_progress = self.w_progress * ego_velocity
+        # Progress reward (encourage forward motion, normalized)
+        # Scale to [0, w_progress] where max at target_speed
+        r_progress = self.w_progress * (ego_velocity / target_speed)
         
         # Comfort reward (penalize large accelerations)
         r_comfort = -self.w_comfort * (action[0] ** 2)
         
+        # === Safety Recovery Bonuses ===
+        r_safety = 0.0
+        
+        # Reward for maintaining safe TTC
+        tau_min = self.constraint_thresholds['ttc_min']
+        tau_comfort = tau_min * 1.5  # Comfortable TTC threshold
+        if lead_distance < 100 and lead_distance > 0:
+            if ttc > tau_comfort:
+                # Bonus for maintaining comfortable TTC
+                r_safety += 0.5
+            elif ttc > tau_min:
+                # Small bonus for being safe but close
+                safety_margin = (ttc - tau_min) / (tau_comfort - tau_min)
+                r_safety += 0.2 * safety_margin
+        
+        # Reward for maintaining safe headway
+        s_0 = self.constraint_thresholds['headway_s0']
+        T_h = self.constraint_thresholds['headway_T']
+        if lead_distance < 100 and lead_distance > 0:
+            desired_headway = s_0 + T_h * ego_velocity
+            if lead_distance > desired_headway * 1.2:
+                # Bonus for comfortable following distance
+                r_safety += 0.3
+            elif lead_distance > desired_headway:
+                # Small bonus for safe following
+                safety_margin = (lead_distance - desired_headway) / (desired_headway * 0.2)
+                r_safety += 0.15 * safety_margin
+        
+        # Reward for smooth control (low jerk)
+        if self.prev_action is not None:
+            dt = 0.1
+            jerk = abs((action[0] - self.prev_action[0]) / dt)
+            j_max = self.constraint_thresholds['jerk_max']
+            if jerk < j_max * 0.5:
+                # Bonus for very smooth control
+                smoothness = 1.0 - (jerk / (j_max * 0.5))
+                r_safety += 0.2 * smoothness
+        
         # Total reward
-        reward = r_speed + r_lane + r_progress + r_comfort
+        reward = r_speed + r_lane + r_progress + r_comfort + r_safety
         
         return reward
     

@@ -27,9 +27,7 @@ from config.environment_config import get_scenario_config
 
 def test_hierarchical_controller():
     """Test hierarchical controller initialization and basic operations."""
-    print("\n" + "="*60)
-    print("Testing Hierarchical Constrained RL Controller")
-    print("="*60 + "\n")
+    
     
     # Create environment with normal traffic
     print("1. Creating environment...")
@@ -39,10 +37,6 @@ def test_hierarchical_controller():
         vehicles_count=env_config['vehicles_count'],
         duration=env_config['duration'],
     )
-    print("   ✓ Environment created")
-    print(f"   - Observation space: {env.observation_space.shape}")
-    print(f"   - Action space: {env.action_space.shape}")
-    
     # Create controller
     print("\n2. Creating hierarchical controller...")
     
