@@ -112,10 +112,10 @@ class HierarchicalVisualizer:
         maneuver_config = config.maneuver_policy.to_dict()
         maneuver_policy = RuleBasedManeuverPolicy(maneuver_config)
         
-        # Create trajectory policy (action_dim=1 for longitudinal control only)
+        # Create trajectory policy (action_dim=2 for longitudinal + lateral control)
         trajectory_config = {
             'obs_dim': 18,
-            'act_dim': 1,
+            'act_dim': 2,  # UPDATED: 2D action space [acceleration, lane_change]
             'hidden_dim': 256,
             'lr': 3e-4,
             'gamma': 0.99,
@@ -210,21 +210,28 @@ class HierarchicalVisualizer:
             # Compute action
             action = self.controller.compute_action(obs, info)
             
-            # Handle 1D action (longitudinal only)
+            # Handle 2D action [acceleration, lane_change]
             if isinstance(action, np.ndarray):
-                action_scalar = float(action[0]) if len(action) > 0 else float(action)
+                action_accel = float(action[0]) if len(action) > 0 else 0.0
+                action_lane = float(action[1]) if len(action) > 1 else 0.0
             else:
-                action_scalar = float(action)
+                action_accel = float(action)
+                action_lane = 0.0
             
-            # Debug: print details every 50 steps
+            # Debug: print details every 50 steps with lane change info
             if verbose and episode_length % 50 == 0:
                 ego_speed = obs[3]
                 lead_dist = obs[0]
                 ttc_val = obs[2]
-                print(f"    DEBUG Step {episode_length}: ego_speed={ego_speed:.1f}, lead_dist={lead_dist:.1f}, ttc={ttc_val:.1f}, action={action_scalar:.3f}")
+                lane_state = info.get('lane_change_state', -1)
+                current_lane = info.get('current_lane', -1)
+                target_lane = info.get('target_lane', None)
+                state_names = {0: 'IDLE', 1: 'EXECUTING', 2: 'COOLDOWN'}
+                state_name = state_names.get(lane_state, 'UNKNOWN')
+                print(f"    DEBUG Step {episode_length}: ego_speed={ego_speed:.1f}, lead_dist={lead_dist:.1f}, ttc={ttc_val:.1f}, accel={action_accel:.3f}, lane_cmd={action_lane:.3f}, current_lane={current_lane}, state={state_name}, target={target_lane}")
             
             # Compute jerk (ensure it's a scalar)
-            jerk = float(abs(action_scalar - prev_action))
+            jerk = float(abs(action_accel - prev_action))
             
             # Check violations
             ttc_violated = obs[2] < 2.0 and obs[0] < 50.0  # TTC < 2s and close
@@ -243,7 +250,7 @@ class HierarchicalVisualizer:
             self.data["relative_distance"].append(obs[0])
             self.data["relative_velocity"].append(obs[1])
             self.data["ttc"].append(obs[2])
-            self.data["action"].append(action_scalar)
+            self.data["action"].append(action_accel)  # Store longitudinal action for plotting
             self.data["maneuver"].append(self.controller.maneuver_policy.current_maneuver)
             self.data["ttc_violation"].append(1 if ttc_violated else 0)
             self.data["headway_violation"].append(1 if headway_violated else 0)
@@ -255,7 +262,7 @@ class HierarchicalVisualizer:
             episode_reward += reward
             episode_length += 1
             self.data["reward"].append(reward)
-            prev_action = action_scalar
+            prev_action = action_accel
             
             # Print progress
             if verbose and episode_length % 100 == 0:
@@ -265,7 +272,7 @@ class HierarchicalVisualizer:
                     f"Dist={obs[0]:5.1f} m, "
                     f"TTC={obs[2]:5.1f} s, "
                     f"Maneuver={self.controller.maneuver_policy.current_maneuver}, "
-                    f"Action={action_scalar:5.2f}"
+                    f"Accel={action_accel:5.2f}, Lane={action_lane:5.2f}"
                 )
         
         # Get controller statistics
