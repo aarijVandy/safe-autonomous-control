@@ -74,13 +74,43 @@ class NADEHighwayEnv(gym.Env):
         # Create base highway-env environment
         self._create_base_env(config)
         
-        # Define observation space (5 features: rel_dist, rel_vel, ttc, ego_vel, lane_info)
-        # We use normalized values for stable learning
+        # Enhanced observation space for hierarchical constrained RL (18 features):
+        # [0] rel_distance_lead: relative distance to lead vehicle (m)
+        # [1] rel_velocity_lead: relative velocity with lead vehicle (m/s)
+        # [2] ttc_lead: time-to-collision with lead vehicle (s)
+        # [3] ego_velocity: ego vehicle velocity (m/s)
+        # [4] ego_lane_idx: current lane index (normalized)
+        # [5] ego_lane_offset: lateral offset from lane center (m)
+        # [6] right_veh_distance: distance to right-side vehicle (m)
+        # [7] right_veh_rel_velocity: relative velocity with right vehicle (m/s)
+        # [8] right_veh_lateral_dist: lateral distance to right vehicle (m)
+        # [9] left_veh_distance: distance to left-side vehicle (m)
+        # [10] left_veh_rel_velocity: relative velocity with left vehicle (m/s)
+        # [11] left_veh_lateral_dist: lateral distance to left vehicle (m)
+        # [12-14] lead_veh_predicted_pos: 0.5s ahead prediction [dx, dy, dv]
+        # [15-17] right_veh_predicted_pos: 0.5s ahead prediction [dx, dy, dv]
         self.observation_space = spaces.Box(
-            low=np.array([-np.inf, -30.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([np.inf, 30.0, 100.0, 40.0, 1.0], dtype=np.float32),
+            low=np.array([
+                -np.inf, -30.0, 0.0, 0.0,  # lead vehicle, ego velocity
+                0.0, -2.0,  # lane index, lane offset
+                -np.inf, -30.0, 0.0,  # right vehicle
+                -np.inf, -30.0, 0.0,  # left vehicle
+                -np.inf, -5.0, -30.0,  # lead prediction
+                -np.inf, -5.0, -30.0,  # right prediction
+            ], dtype=np.float32),
+            high=np.array([
+                np.inf, 30.0, 100.0, 40.0,  # lead vehicle, ego velocity
+                3.0, 2.0,  # lane index, lane offset
+                np.inf, 30.0, 10.0,  # right vehicle
+                np.inf, 30.0, 10.0,  # left vehicle
+                np.inf, 5.0, 30.0,  # lead prediction
+                np.inf, 5.0, 30.0,  # right prediction
+            ], dtype=np.float32),
             dtype=np.float32,
         )
+        
+        # Prediction horizon for neighbor vehicles
+        self.prediction_horizon = 0.5  # seconds
         
         # Define action space: continuous acceleration [-3, 2] m/s²
         self.action_space = spaces.Box(
@@ -96,6 +126,11 @@ class NADEHighwayEnv(gym.Env):
             "avg_speed": 0.0,
             "timesteps": 0,
         }
+        
+        # Vehicle spawning parameters for continuous traffic generation
+        self.spawn_interval = 50  # Spawn new vehicles every 50 steps (5 seconds at 10Hz)
+        self.max_vehicles = vehicles_count  # Maintain target vehicle count
+        self.steps_since_last_spawn = 0
     
     def _create_base_env(self, config: Optional[Dict[str, Any]] = None):
         """Create and configure the base highway-env environment."""
@@ -118,7 +153,7 @@ class NADEHighwayEnv(gym.Env):
             "vehicles_count": self.vehicles_count,
             "duration": self.duration,
             "simulation_frequency": 15,  # Hz
-            "policy_frequency": 5,  # Hz (neural policy must run at 10-20 Hz)
+            "policy_frequency": 10,  # Hz (increased from 5 to allow longer episodes)
             "other_vehicles_type": "highway_env.vehicle.behavior.IDMVehicle",
             "initial_lane_id": None,
             "ego_spacing": 2,
@@ -126,9 +161,15 @@ class NADEHighwayEnv(gym.Env):
             "collision_reward": -1.0,
             "right_lane_reward": 0.0,  # No lateral control focus
             "high_speed_reward": 0.4,
-            "reward_speed_range": [20, 30],
+            "reward_speed_range": [15, 20],  # Adjusted for 60 kph (16.67 m/s) traffic
             "normalize_reward": True,
             "offroad_terminal": True,
+            # IDM vehicle configuration for 60 kph traffic
+            "IDM_COMFORT_ACC_MAX": 1.0,  # Comfortable acceleration
+            "IDM_COMFORT_ACC_MIN": -2.0,  # Comfortable deceleration
+            "IDM_DESIRED_VELOCITY": 16.67,  # 60 kph in m/s
+            "IDM_TIME_WANTED": 1.5,  # Desired time headway
+            "IDM_DELTA": 4.0,  # Acceleration exponent
         }
         
         # Apply custom config overrides
@@ -141,65 +182,240 @@ class NADEHighwayEnv(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Extract NADE-compatible observation from highway-env state.
+        Extract enhanced observation from highway-env state.
         
         Returns:
-            observation: [relative_distance, relative_velocity, ttc, ego_velocity, lane_occupancy]
+            observation: 18-dimensional vector with:
+                - Lead vehicle state (distance, velocity, TTC)
+                - Ego state (velocity, lane index, lane offset)
+                - Right/left vehicle states
+                - 0.5s-ahead predictions for lead and right vehicles
         """
         # Extract ego vehicle state
         ego = self.env.unwrapped.vehicle
         if ego is None:
-            # Vehicle not initialized yet, return default observation
-            return np.array([100.0, 0.0, 100.0, 0.0, 0.0], dtype=np.float32)
+            # Vehicle not initialized yet, return default observation (18 features)
+            return np.zeros(18, dtype=np.float32)
         
         ego_velocity = ego.speed
+        ego_lane = ego.lane_index[2] if isinstance(ego.lane_index, tuple) else 0
+        ego_position = ego.position
         
-        # Find lead vehicle (closest vehicle ahead in same lane)
+        # Get lane offset (distance from lane center)
+        try:
+            lane = ego.lane
+            ego_lane_offset = ego.position[1] - lane.position(ego.position[0], 0)[1]
+        except:
+            ego_lane_offset = 0.0
+        
+        # Find relevant vehicles (lead, right, left)
         lead_vehicle = None
-        min_distance = float("inf")
+        right_vehicle = None
+        left_vehicle = None
+        min_lead_distance = float("inf")
+        min_right_distance = float("inf")
+        min_left_distance = float("inf")
         
         for vehicle in self.env.unwrapped.road.vehicles:
-            if vehicle != ego and vehicle.lane_index == ego.lane_index:
-                distance = vehicle.position[0] - ego.position[0]
-                if 0 < distance < min_distance:
-                    min_distance = distance
-                    lead_vehicle = vehicle
+            if vehicle == ego:
+                continue
+            
+            vehicle_lane = vehicle.lane_index[2] if isinstance(vehicle.lane_index, tuple) else 0
+            longitudinal_distance = vehicle.position[0] - ego_position[0]
+            
+            # Check for lead vehicle (ahead in same lane)
+            if vehicle_lane == ego_lane and 0 < longitudinal_distance < min_lead_distance:
+                min_lead_distance = longitudinal_distance
+                lead_vehicle = vehicle
+            
+            # Check for right-side vehicle
+            if vehicle_lane == ego_lane + 1:  # One lane to the right
+                abs_long_dist = abs(longitudinal_distance)
+                if abs_long_dist < 30.0 and abs_long_dist < min_right_distance:
+                    min_right_distance = abs_long_dist
+                    right_vehicle = vehicle
+            
+            # Check for left-side vehicle
+            if vehicle_lane == ego_lane - 1:  # One lane to the left
+                abs_long_dist = abs(longitudinal_distance)
+                if abs_long_dist < 30.0 and abs_long_dist < min_left_distance:
+                    min_left_distance = abs_long_dist
+                    left_vehicle = vehicle
         
-        # Calculate observation features
+        # Calculate observation features for lead vehicle
         if lead_vehicle is not None:
-            relative_distance = lead_vehicle.position[0] - ego.position[0] - 5.0  # 5m vehicle length
-            relative_velocity = lead_vehicle.speed - ego.speed
+            lead_rel_distance = lead_vehicle.position[0] - ego_position[0] - 5.0  # 5m vehicle length
+            lead_rel_velocity = lead_vehicle.speed - ego_velocity
             
             # Calculate time-to-collision (TTC)
-            if relative_velocity < -0.1:  # Approaching
-                ttc = max(0.0, relative_distance / abs(relative_velocity))
+            if lead_rel_velocity < -0.1:  # Approaching
+                lead_ttc = max(0.0, lead_rel_distance / abs(lead_rel_velocity))
             else:
-                ttc = 100.0  # Large value if not approaching
+                lead_ttc = 100.0  # Large value if not approaching
+            
+            # Predict lead vehicle position after prediction_horizon
+            lead_pred_dx = lead_rel_distance + lead_rel_velocity * self.prediction_horizon
+            lead_pred_dy = 0.0  # Assume constant lane
+            lead_pred_dv = lead_rel_velocity  # Constant velocity assumption
         else:
-            # No lead vehicle
-            relative_distance = 100.0
-            relative_velocity = 0.0
-            ttc = 100.0
+            lead_rel_distance = 100.0
+            lead_rel_velocity = 0.0
+            lead_ttc = 100.0
+            lead_pred_dx = 100.0
+            lead_pred_dy = 0.0
+            lead_pred_dv = 0.0
         
-        # Check adjacent lane occupancy (simplified for now)
-        lane_occupancy = 0.0
-        if self.num_lanes > 1:
-            # Check if there are vehicles in adjacent lanes (for future lane-change adversaries)
-            for vehicle in self.env.unwrapped.road.vehicles:
-                if vehicle != ego:
-                    lateral_distance = abs(vehicle.lane_index[2] - ego.lane_index[2])
-                    if lateral_distance == 1:  # Adjacent lane
-                        longitudinal_distance = abs(vehicle.position[0] - ego.position[0])
-                        if longitudinal_distance < 20.0:  # Within 20m
-                            lane_occupancy = 1.0
-                            break
+        # Calculate observation features for right-side vehicle
+        if right_vehicle is not None:
+            right_veh_distance = right_vehicle.position[0] - ego_position[0]
+            right_veh_rel_velocity = right_vehicle.speed - ego_velocity
+            right_veh_lateral_dist = abs((right_vehicle.lane_index[2] if isinstance(right_vehicle.lane_index, tuple) else 0) - ego_lane) * 4.0
+            
+            # Predict right vehicle position after prediction_horizon
+            right_pred_dx = right_veh_distance + right_veh_rel_velocity * self.prediction_horizon
+            right_pred_dy = 0.0  # Simplified: assume no lane change during prediction
+            right_pred_dv = right_veh_rel_velocity
+        else:
+            right_veh_distance = 100.0
+            right_veh_rel_velocity = 0.0
+            right_veh_lateral_dist = 10.0
+            right_pred_dx = 100.0
+            right_pred_dy = 0.0
+            right_pred_dv = 0.0
         
-        observation = np.array(
-            [relative_distance, relative_velocity, ttc, ego_velocity, lane_occupancy],
-            dtype=np.float32,
-        )
+        # Calculate observation features for left-side vehicle
+        if left_vehicle is not None:
+            left_veh_distance = left_vehicle.position[0] - ego_position[0]
+            left_veh_rel_velocity = left_vehicle.speed - ego_velocity
+            left_veh_lateral_dist = abs((left_vehicle.lane_index[2] if isinstance(left_vehicle.lane_index, tuple) else 0) - ego_lane) * 4.0
+        else:
+            left_veh_distance = 100.0
+            left_veh_rel_velocity = 0.0
+            left_veh_lateral_dist = 10.0
+        
+        # Construct 18-dimensional observation
+        observation = np.array([
+            # Lead vehicle (3 features)
+            lead_rel_distance,
+            lead_rel_velocity,
+            lead_ttc,
+            # Ego state (3 features)
+            ego_velocity,
+            float(ego_lane) / max(1, self.num_lanes - 1),  # Normalized lane index
+            ego_lane_offset,
+            # Right vehicle (3 features)
+            right_veh_distance,
+            right_veh_rel_velocity,
+            right_veh_lateral_dist,
+            # Left vehicle (3 features)
+            left_veh_distance,
+            left_veh_rel_velocity,
+            left_veh_lateral_dist,
+            # Lead vehicle prediction (3 features)
+            lead_pred_dx,
+            lead_pred_dy,
+            lead_pred_dv,
+            # Right vehicle prediction (3 features)
+            right_pred_dx,
+            right_pred_dy,
+            right_pred_dv,
+        ], dtype=np.float32)
         
         return observation
+    
+    def _spawn_new_vehicles(self):
+        """
+        Spawn new vehicles to maintain traffic density throughout the simulation.
+        This ensures continuous traffic flow rather than just initial vehicle generation.
+        Vehicles are spawned at 60 kph (16.67 m/s) with small variations.
+        """
+        # Check if it's time to spawn and if we're below max vehicle count
+        if self.steps_since_last_spawn < self.spawn_interval:
+            return
+        
+        # Reset spawn counter
+        self.steps_since_last_spawn = 0
+        
+        # Count current vehicles (excluding ego)
+        ego = self.env.unwrapped.vehicle
+        if ego is None:
+            return
+            
+        current_vehicles = [v for v in self.env.unwrapped.road.vehicles if v != ego]
+        
+        # Only spawn if below target count
+        if len(current_vehicles) >= self.max_vehicles:
+            return
+        
+        # Calculate how many vehicles to spawn (1-3 at a time)
+        vehicles_needed = min(3, self.max_vehicles - len(current_vehicles))
+        
+        try:
+            # Import vehicle classes
+            from highway_env.vehicle.behavior import IDMVehicle
+            from highway_env.road.road import Road, RoadNetwork
+            
+            road = self.env.unwrapped.road
+            
+            # Spawn vehicles ahead AND behind ego vehicle in random lanes
+            for i in range(vehicles_needed):
+                # Choose a random lane
+                lane_idx = np.random.randint(0, self.num_lanes)
+                
+                # Alternate spawning ahead and behind
+                if i % 2 == 0:
+                    # Spawn ahead of ego vehicle (80-150m ahead)
+                    spawn_distance = ego.position[0] + np.random.uniform(80, 150)
+                else:
+                    # Spawn behind ego vehicle (50-100m behind)
+                    spawn_distance = ego.position[0] - np.random.uniform(50, 100)
+                
+                # Target speed: 60 kph (16.67 m/s) with ±2 m/s variation
+                target_speed = np.random.uniform(14.67, 18.67)  # 53-67 kph
+                
+                # Get the lane
+                try:
+                    # Create new vehicle using highway-env's make_on_lane
+                    new_vehicle = IDMVehicle.make_on_lane(
+                        road=road,
+                        lane_index=("0", "1", lane_idx),
+                        longitudinal=spawn_distance,
+                        speed=target_speed,
+                    )
+                    
+                    # Set IDM parameters for 60 kph driving
+                    new_vehicle.target_speed = target_speed
+                    if hasattr(new_vehicle, 'COMFORT_ACC_MAX'):
+                        new_vehicle.COMFORT_ACC_MAX = 1.0
+                    if hasattr(new_vehicle, 'COMFORT_ACC_MIN'):
+                        new_vehicle.COMFORT_ACC_MIN = -2.0
+                    if hasattr(new_vehicle, 'TIME_WANTED'):
+                        new_vehicle.TIME_WANTED = 1.5
+                    
+                    # Check if spawn position is safe (no collision with existing vehicles)
+                    safe_spawn = True
+                    for vehicle in current_vehicles:
+                        if vehicle == ego:
+                            continue
+                        distance = abs(vehicle.position[0] - new_vehicle.position[0])
+                        lateral_dist = abs(vehicle.position[1] - new_vehicle.position[1])
+                        
+                        # Check both longitudinal and lateral distance
+                        if distance < 20.0 and lateral_dist < 3.0:  # Too close
+                            safe_spawn = False
+                            break
+                    
+                    # Add vehicle if safe
+                    if safe_spawn:
+                        road.vehicles.append(new_vehicle)
+                
+                except (AttributeError, IndexError, KeyError, ValueError) as e:
+                    # Lane doesn't exist or other error, skip this spawn
+                    pass
+        
+        except ImportError:
+            # highway_env not available or different structure
+            pass
     
     def _apply_adversarial_behavior(self):
         """
@@ -213,6 +429,7 @@ class NADEHighwayEnv(gym.Env):
         if not self.adversarial_mode:
             return
         
+        # TODO: fix this afterwards
         # This is a simplified implementation
         # In practice, NADE uses trained adversarial agents
         # For now, we randomly trigger adversarial behaviors
@@ -244,6 +461,9 @@ class NADEHighwayEnv(gym.Env):
             "timesteps": 0,
         }
         
+        # Reset vehicle spawning counter
+        self.steps_since_last_spawn = 0
+        
         # Get initial observation
         observation = self._get_observation()
         info = self._get_info()
@@ -269,12 +489,23 @@ class NADEHighwayEnv(gym.Env):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
         
+        # Spawn new vehicles to maintain traffic density
+        self._spawn_new_vehicles()
+        self.steps_since_last_spawn += 1
+        
         # Apply adversarial behaviors
         self._apply_adversarial_behavior()
         
-        # Convert acceleration to highway-env action format
+        # Convert acceleration from [-3, 2] m/s² to normalized action [-1, 1]
+        # highway-env's ContinuousAction expects normalized values
+        # Normalize: action_norm = (action - min) / (max - min) * 2 - 1
+        # For acceleration range [-3, 2]: min=-3, max=2, range=5
+        accel_value = float(action[0])
+        normalized_accel = ((accel_value - (-3.0)) / 5.0) * 2.0 - 1.0
+        normalized_accel = np.clip(normalized_accel, -1.0, 1.0)
+        
         # highway-env expects [steering, acceleration] for ContinuousAction
-        highway_action = np.array([0.0, float(action[0])])
+        highway_action = np.array([0.0, normalized_accel])
         
         # Step base environment
         _, reward, terminated, truncated, info = self.env.step(highway_action)
