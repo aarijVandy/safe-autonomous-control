@@ -1,5 +1,5 @@
 """
-SAC-based Trajectory Policy with Lagrangian Constraint Enforcement.
+SAC-based Trajectory Policy 
 
 This module implements a Soft Actor-Critic (SAC) policy for continuous control
 with explicit safety constraints enforced via Lagrangian multipliers.
@@ -112,12 +112,44 @@ class Actor(nn.Module):
         self.log_std = nn.Linear(hidden_dim, act_dim)
         
         # Action bounds for highway driving
-        self.action_scale = torch.FloatTensor([2.5])  # (max - min) / 2 = (2 - (-3)) / 2
-        self.action_bias = torch.FloatTensor([-0.5])  # (max + min) / 2 = (2 + (-3)) / 2
+        # For 2D actions: [acceleration, steering]
+        # acceleration: [-3, 2] m/s² → scale=2.5, bias=-0.5
+        # steering: [-1, 1] → scale=1.0, bias=0.0
+        if act_dim == 1:
+            self.action_scale = torch.FloatTensor([2.5])
+            self.action_bias = torch.FloatTensor([-0.5])
+        else:
+            self.action_scale = torch.FloatTensor([2.5, 1.0])
+            self.action_bias = torch.FloatTensor([-0.5, 0.0])
         
         # Log std bounds
         self.log_std_min = -20
         self.log_std_max = 2
+        
+        # Initialize weights to bias toward zero steering (straight driving)
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """
+        Initialize network weights to bias toward straight driving (zero steering).
+        
+        The mean output layer is initialized with very small weights so that
+        untrained policy outputs near-zero actions in the normalized space,
+        which translates to:
+        - Small acceleration (close to 0 after denormalization)
+        - Zero steering (straight driving)
+        
+        This prevents random turning behavior before the policy is trained.
+        """
+        # Initialize mean output layer with very small weights
+        # This makes untrained policy output ~0 in normalized space [-1, 1]
+        nn.init.uniform_(self.mean.weight, -3e-3, 3e-3)
+        nn.init.constant_(self.mean.bias, 0.0)
+        
+        # Initialize log_std output layer conservatively
+        # Start with lower exploration noise
+        nn.init.uniform_(self.log_std.weight, -3e-3, 3e-3)
+        nn.init.constant_(self.log_std.bias, -2.0)  # Start with low variance
     
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -307,12 +339,15 @@ class SACTrajectoryPolicy(ConstrainedController):
         
         Args:
             observation: Current observation
-            info: Additional information
+            info: Additional information (includes current_maneuver from hierarchical controller)
         
         Returns:
-            action: Control action
+            action: Control action [acceleration, lane_change_command]
         """
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+        
+        # Get maneuver decision from hierarchical controller
+        current_maneuver = info.get('current_maneuver', 0) if info else 0
         
         if self.training_mode:
             # Sample action from policy
@@ -326,8 +361,50 @@ class SACTrajectoryPolicy(ConstrainedController):
                 action = torch.tanh(mean) * self.actor.action_scale + self.actor.action_bias
             action = action.cpu().numpy()[0]
         
-        # Clip to valid range
-        action = np.clip(action, -3.0, 2.0)
+        # Handle action dimensionality
+        if self.act_dim == 1:
+            # Legacy 1D action (longitudinal only) - add neutral lateral component
+            action = np.array([action[0], 0.0])
+        elif self.act_dim == 2:
+            # 2D action: override lateral component based on maneuver policy
+            # action[0] = longitudinal (from RL policy)
+            # action[1] = lateral (influenced by maneuver policy)
+            
+            # Get current lane from observation
+            ego_lane_norm = observation[4]  # Normalized lane index
+            num_lanes = 3
+            ego_lane = int(ego_lane_norm * (num_lanes - 1))
+            
+            # Maneuver constants: KEEP_LANE=0, CHANGE_LEFT=1, CHANGE_RIGHT=2
+            if current_maneuver == 1:  # CHANGE_LEFT
+                # Only allow left change if not in leftmost lane (lane 0)
+                if ego_lane > 0:
+                    action[1] = -0.8  # Strong left signal
+                else:
+                    action[1] = 0.0  # Already at left boundary, keep lane
+            elif current_maneuver == 2:  # CHANGE_RIGHT
+                # Only allow right change if not in rightmost lane (lane 2)
+                if ego_lane < (num_lanes - 1):
+                    action[1] = 0.8   # Strong right signal
+                else:
+                    action[1] = 0.0  # Already at right boundary, keep lane
+            elif current_maneuver == 0:  # KEEP_LANE
+                # Allow moderate corrections from RL policy for obstacle avoidance
+                # Also enforce lane boundaries
+                if ego_lane == 0:
+                    # Leftmost lane: only allow neutral or right corrections
+                    action[1] = np.clip(action[1], 0.0, 0.5)
+                elif ego_lane == num_lanes - 1:
+                    # Rightmost lane: only allow neutral or left corrections
+                    action[1] = np.clip(action[1], -0.5, 0.0)
+                else:
+                    # Middle lane: allow moderate corrections both ways
+                    action[1] = np.clip(action[1], -0.5, 0.5)
+        
+        # Clip to valid ranges
+        action[0] = np.clip(action[0], -3.0, 2.0)   # acceleration
+        if len(action) > 1:
+            action[1] = np.clip(action[1], -1.0, 1.0)  # lane change command
         
         return action
     
@@ -443,54 +520,87 @@ class SACTrajectoryPolicy(ConstrainedController):
         ego_velocity = observation[3]
         lane_offset = observation[5]
         
-        # Speed tracking reward (use linear error for better scaling)
+        # Speed tracking reward - IMPROVED: More positive signal
         target_speed = 16.67  # m/s (60 km/h) - matching traffic speed
         speed_error = abs(ego_velocity - target_speed)
-        # Use smooth reward: r = -w * |error| for |error| > 1, else -w * error^2 
-        if speed_error > 1.0:
-            r_speed = -self.w_speed * speed_error
+        # Give POSITIVE reward for being close to target, small penalty for deviation
+        if speed_error < 2.0:
+            # Good speed - positive reward
+            r_speed = self.w_speed * (1.0 - speed_error / 2.0)  # [0, 2.0]
         else:
-            r_speed = -self.w_speed * (speed_error ** 2)
+            # Too far from target - small penalty
+            r_speed = -self.w_speed * 0.5 * speed_error  # Moderate penalty
         
-        # Lane centering reward (potential-based)
-        r_lane = -self.w_lane * (lane_offset ** 2)
+        # Lane centering reward - IMPROVED: Less penalty for small deviations
+        if abs(lane_offset) < 1.0:
+            r_lane = self.w_lane * 0.5  # Bonus for good centering
+        else:
+            r_lane = -self.w_lane * 0.2 * (lane_offset ** 2)  # Reduced penalty
         
-        # Progress reward (encourage forward motion, normalized)
+        # Progress reward - INCREASED: Always positive for moving forward
         # Scale to [0, w_progress] where max at target_speed
-        r_progress = self.w_progress * (ego_velocity / target_speed)
+        r_progress = self.w_progress * 2.0 * (ego_velocity / target_speed)  # Doubled
         
         # Comfort reward (penalize large accelerations)
         r_comfort = -self.w_comfort * (action[0] ** 2)
         
-        # === Safety Recovery Bonuses ===
+        # Lane change rewards (for 2D action space) - STRONG PENALTIES
+        r_lane_change = 0.0
+        if len(action) > 1:
+            lane_cmd = action[1]
+            ego_lane_norm = observation[4]
+            num_lanes = 3
+            ego_lane = int(ego_lane_norm * (num_lanes - 1))
+            
+            # STRONG penalty for lane changes - DISCOURAGE HEAVILY
+            lane_change_magnitude = abs(lane_cmd)
+            if lane_change_magnitude > 0.7:  # Strong lane change command
+                # Heavy penalty: -2.0 per timestep during lane change
+                r_lane_change -= 2.0
+            elif lane_change_magnitude > 0.33:  # Moderate lane change
+                # Moderate penalty: -1.0 per timestep
+                r_lane_change -= 1.0
+            
+            # LARGE bonus for keeping lane (staying centered)
+            if lane_change_magnitude < 0.2:  # Keeping lane stable
+                r_lane_change += 0.5  # Reward stability
+            
+            # Additional bonus for right lane (default/safe lane)
+            if ego_lane == num_lanes - 1 and lane_change_magnitude < 0.2:
+                r_lane_change += 0.3  # Extra bonus for rightmost lane stability
+        
+        # === Safety Recovery Bonuses - INCREASED ===
         r_safety = 0.0
         
-        # Reward for maintaining safe TTC
+        # Reward for maintaining safe TTC - DOUBLED bonuses
         tau_min = self.constraint_thresholds['ttc_min']
         tau_comfort = tau_min * 1.5  # Comfortable TTC threshold
         if lead_distance < 100 and lead_distance > 0:
             if ttc > tau_comfort:
                 # Bonus for maintaining comfortable TTC
-                r_safety += 0.5
+                r_safety += 1.0  # Increased from 0.5
             elif ttc > tau_min:
                 # Small bonus for being safe but close
                 safety_margin = (ttc - tau_min) / (tau_comfort - tau_min)
-                r_safety += 0.2 * safety_margin
+                r_safety += 0.5 * safety_margin  # Increased from 0.2
+        else:
+            # No vehicle ahead - big bonus for clear road
+            r_safety += 0.5
         
-        # Reward for maintaining safe headway
+        # Reward for maintaining safe headway - DOUBLED bonuses
         s_0 = self.constraint_thresholds['headway_s0']
         T_h = self.constraint_thresholds['headway_T']
         if lead_distance < 100 and lead_distance > 0:
             desired_headway = s_0 + T_h * ego_velocity
             if lead_distance > desired_headway * 1.2:
                 # Bonus for comfortable following distance
-                r_safety += 0.3
+                r_safety += 0.6  # Increased from 0.3
             elif lead_distance > desired_headway:
                 # Small bonus for safe following
                 safety_margin = (lead_distance - desired_headway) / (desired_headway * 0.2)
-                r_safety += 0.15 * safety_margin
+                r_safety += 0.3 * safety_margin  # Increased from 0.15
         
-        # Reward for smooth control (low jerk)
+        # Reward for smooth control (low jerk) - DOUBLED
         if self.prev_action is not None:
             dt = 0.1
             jerk = abs((action[0] - self.prev_action[0]) / dt)
@@ -498,10 +608,18 @@ class SACTrajectoryPolicy(ConstrainedController):
             if jerk < j_max * 0.5:
                 # Bonus for very smooth control
                 smoothness = 1.0 - (jerk / (j_max * 0.5))
-                r_safety += 0.2 * smoothness
+                r_safety += 0.4 * smoothness  # Increased from 0.2
+        
+        # === SURVIVAL BONUS - Reward for staying alive ===
+        # Large positive reward for each timestep without crashing/going off-road
+        r_survival = 1.0  # +1.0 per timestep for staying alive and on-road
+        
+        # Additional bonus for staying in valid lane (not at boundaries)
+        if abs(lane_offset) < 2.0:  # Well within lane boundaries
+            r_survival += 0.5  # Extra bonus for safe lane position
         
         # Total reward
-        reward = r_speed + r_lane + r_progress + r_comfort + r_safety
+        reward = r_speed + r_lane + r_progress + r_comfort + r_lane_change + r_safety + r_survival
         
         return reward
     

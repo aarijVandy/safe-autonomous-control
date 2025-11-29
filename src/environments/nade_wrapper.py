@@ -73,8 +73,8 @@ class NADEHighwayEnv(gym.Env):
         
         # === TRAINING CURRICULUM PARAMETERS ===
         self.episode_count = 0  # Track total episodes
-        self.LATERAL_UNLOCK_EPISODE = 200  # Freeze lateral control for first 200 episodes
-        self.ADVERSARIAL_UNLOCK_EPISODE = 300  # Delay adversarial traffic until episode 300
+        self.LATERAL_UNLOCK_EPISODE = 0  # Freeze lateral control for first 200 episodes
+        self.ADVERSARIAL_UNLOCK_EPISODE = 10  # Delay adversarial traffic until episode 300
         self.ttc_violations_history = []  # Track TTC violations for performance-based unlock
         
         # Lane change state machine - MUCH MORE CONSERVATIVE
@@ -91,7 +91,7 @@ class NADEHighwayEnv(gym.Env):
         self.lane_change_aborted = False  # Track if lane change was aborted for safety
         
         # === STEERING LIMITS ===
-        self.MAX_STEERING = 0.05  # VERY conservative steering limit (was 0.2)
+        self.MAX_STEERING = 0.15  # Increased to allow meaningful lane changes
         
         # Create base highway-env environment
         self._create_base_env(config)
@@ -534,6 +534,9 @@ class NADEHighwayEnv(gym.Env):
         # Reset vehicle spawning counter
         self.steps_since_last_spawn = 0
         
+        # === CRITICAL: Reset per-episode timestep counter ===
+        self.episode_timesteps = 0  # Track timesteps within this episode
+        
         # Reset lane change state machine
         self.lane_change_state = self.LANE_CHANGE_IDLE
         self.lane_change_timer = 0
@@ -565,6 +568,9 @@ class NADEHighwayEnv(gym.Env):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
         
+        # Increment per-episode timestep counter
+        self.episode_timesteps += 1
+        
         # Spawn new vehicles to maintain traffic density
         self._spawn_new_vehicles()
         self.steps_since_last_spawn += 1
@@ -576,9 +582,14 @@ class NADEHighwayEnv(gym.Env):
         accel_value = float(action[0])  # [-3, 2] m/s²
         lane_cmd = float(action[1])     # [-1, 1] continuous
         
+        # === CRITICAL: FREEZE ALL STEERING FOR FIRST 100 TIMESTEPS ===
+        # This prevents ANY turning in early timesteps to learn pure longitudinal control
+        FREEZE_STEERING_TIMESTEPS = 0
+        steering_frozen = self.episode_timesteps < FREEZE_STEERING_TIMESTEPS
+        
         # === CURRICULUM LEARNING: FREEZE LATERAL CONTROL ===
         # Force lateral control to zero for first N episodes to learn longitudinal stability
-        if self.episode_count < self.LATERAL_UNLOCK_EPISODE:
+        if self.episode_count < self.LATERAL_UNLOCK_EPISODE or steering_frozen:
             lane_cmd = 0.0  # Disable lateral action entirely
             # Agent must learn safe following, speed control, and stability first
         
@@ -620,7 +631,20 @@ class NADEHighwayEnv(gym.Env):
         steering = 0.0
         agent_steering = 0.0  # Track agent's steering request separately
         
-        if self.lane_change_state == self.LANE_CHANGE_IDLE:
+        # === ABSOLUTE STEERING FREEZE FOR FIRST 100 TIMESTEPS ===
+        if steering_frozen:
+            # Agent lateral control is FROZEN for first 100 timesteps
+            # BUT: Apply VERY strong stabilization to keep vehicle in lane center
+            # Use a PD controller with aggressive gains to prevent any lane departure
+            k_p = 0.35  # VERY strong proportional gain for rapid centering
+            k_d = 0.20  # VERY strong derivative gain to kill lateral velocity
+            lateral_velocity = ego.velocity[1] if ego is not None and hasattr(ego, 'velocity') else 0.0
+            steering = -k_p * lane_offset - k_d * lateral_velocity
+            # Allow very large steering during freeze - safety through lane-keeping
+            # This is safe because it aggressively centers the vehicle
+            steering = np.clip(steering, -0.3, 0.3)  # Very aggressive limit for stabilization
+            agent_steering = 0.0  # Agent has no control
+        elif self.lane_change_state == self.LANE_CHANGE_IDLE:
             # === LANE-CENTERING ASSISTIVE CONTROLLER ===
             # Add PD controller to naturally return vehicle to lane center
             k_p = 0.02  # Proportional gain
@@ -629,11 +653,12 @@ class NADEHighwayEnv(gym.Env):
             assistive_steering = -k_p * lane_offset - k_d * lateral_velocity
             
             # Combine agent steering with assistive steering
-            agent_steering = np.clip(lane_cmd * 0.1, -0.03, 0.03)  # PRE-FILTER: very conservative
+            # Removed 0.1 multiplier to allow meaningful steering from agent
+            agent_steering = np.clip(lane_cmd * 0.4, -0.2, 0.2)  # Allow reasonable steering range
             steering = agent_steering + assistive_steering
             
             # === HARD SAFETY FILTER: BLOCK STEERING NEAR LANE BOUNDARIES ===
-            if abs(lane_offset) > 1.6:  # Too close to lane edge
+            if abs(lane_offset) > 2.2:  # Relaxed from 1.6 to allow more maneuvering
                 steering = 0.0  # Cancel all steering to prevent going off-road
             
             # Not currently changing lanes - check if new lane change is requested
@@ -715,7 +740,7 @@ class NADEHighwayEnv(gym.Env):
             else:
                 # Continue with VERY CONSERVATIVE steering
                 direction = 1.0 if self.target_lane > self.lane_change_start_lane else -1.0
-                # Use sine wave with MAX_STEERING limit (0.05)
+                # Use sine wave with MAX_STEERING limit 
                 steering_magnitude = self.MAX_STEERING * np.sin(progress * np.pi)
                 steering = direction * steering_magnitude
         
@@ -731,10 +756,15 @@ class NADEHighwayEnv(gym.Env):
                 self.lane_change_aborted = False
         
         # === FINAL SAFETY CLAMP: Enforce maximum steering limit ===
-        steering = np.clip(steering, -self.MAX_STEERING, self.MAX_STEERING)
+        # During steering freeze, stabilization is already clamped to [-0.15, 0.15]
+        # After freeze, apply normal conservative steering limits
+        if not steering_frozen:
+            steering = np.clip(steering, -self.MAX_STEERING, self.MAX_STEERING)
         
-        # highway-env expects [steering, acceleration] for ContinuousAction
-        highway_action = np.array([steering, normalized_accel])
+        # CRITICAL: highway-env ContinuousAction expects [acceleration, steering] order!
+        # NOT [steering, acceleration] as you might expect
+        # See highway_env/envs/common/action.py:ContinuousAction.get_action()
+        highway_action = np.array([normalized_accel, steering])
         
         # Step base environment
         _, base_reward, terminated, truncated, info = self.env.step(highway_action)
@@ -746,6 +776,8 @@ class NADEHighwayEnv(gym.Env):
         info['current_lane'] = ego_lane_idx
         info['steering'] = steering
         info['lane_cmd'] = lane_cmd
+        info['episode_timesteps'] = self.episode_timesteps
+        info['steering_frozen'] = steering_frozen
         
         # Get NADE-compatible observation
         observation = self._get_observation()
@@ -755,52 +787,48 @@ class NADEHighwayEnv(gym.Env):
         reward = base_reward
         penalty_applied = False
         
+        # === STRONG PENALTY FOR LARGE LATERAL ACCELERATIONS (PREVENT ZIG-ZAG) ===
+        if abs(steering) > 0.03:
+            lateral_penalty = -1.0 * abs(steering)
+            reward += lateral_penalty
+            info['lateral_accel_penalty'] = lateral_penalty
+        
+        # === STRONG LANE-CENTER REWARD ===
+        # Exponential reward for staying near lane center
+        lane_offset = observation[5]  # ego_lane_offset
+        lane_center_reward = 1.5 * np.exp(-abs(lane_offset) * 0.7)
+        reward += lane_center_reward
+        info['lane_center_reward'] = lane_center_reward
+        
         # LANE CHANGE PENALTY - Apply during lane change execution
         if self.lane_change_state == self.LANE_CHANGE_EXECUTING:
             # Continuous penalty throughout lane change to discourage it
-            reward -= 0.5  # -0.5 per timestep during lane change
-            info['lane_change_execution_penalty'] = -0.5
-        
-        # Check for collision (-50 penalty - moderate, not catastrophic)
-        # Apply penalty but continue episode so agent learns from it
+            LANE_PENALTY = 2.0  # INCREASED from 0.5 to strongly discourage
+            reward -= LANE_PENALTY  # -2.0 per timestep during lane change
+            info['lane_change_execution_penalty'] = -LANE_PENALTY
+
+        # Check for collision - TERMINATE EPISODE IMMEDIATELY
         if info.get("crashed", False):
             self.episode_metrics["collisions"] += 1
-            reward = -50.0  # REDUCED from -10000 to allow learning
-            # DON'T terminate - override highway-env's termination
-            terminated = False
+            reward = -100.0  # Large penalty for collision
+            # TERMINATE episode on collision
+            terminated = True
             penalty_applied = True
             info['collision_penalty'] = True
-            
-            # Try to reset vehicle position slightly to avoid repeated collisions
-            if ego is not None:
-                try:
-                    # Move ego vehicle slightly forward to unstick from collision
-                    ego.position = ego.position + np.array([5.0, 0.0])
-                except:
-                    pass
+            info['termination_reason'] = 'collision'
         
-        # Check for going off-road / out of highway bounds (-100 penalty)
-        # This happens when vehicle goes outside valid lanes
+        # Check for going off-road / out of highway bounds - TERMINATE EPISODE
         if ego is not None and not penalty_applied:
             vehicle_lane_idx = ego.lane_index[2] if isinstance(ego.lane_index, tuple) else 0
             # Check if lane index is outside valid range [0, num_lanes-1]
             if vehicle_lane_idx < 0 or vehicle_lane_idx >= self.num_lanes:
-                reward = -100.0  # REDUCED from -10000 to allow learning
-                # DON'T terminate - apply penalty and continue
-                terminated = False
+                reward = -100.0  # Large penalty for going off-road
+                # TERMINATE episode when going off-road
+                terminated = True
                 penalty_applied = True
                 info['off_road_penalty'] = True
+                info['termination_reason'] = 'off_road'
                 self.episode_metrics['collisions'] += 1
-                
-                # Force vehicle back to valid lane
-                try:
-                    # Clamp to nearest valid lane
-                    valid_lane_idx = max(0, min(self.num_lanes - 1, vehicle_lane_idx))
-                    # Update ego vehicle's lane to valid one
-                    if hasattr(ego, 'lane_index') and isinstance(ego.lane_index, tuple):
-                        ego.lane_index = (ego.lane_index[0], ego.lane_index[1], valid_lane_idx)
-                except:
-                    pass
         
         # Check for dangerous lane offset (too far from lane center)
         if not penalty_applied:  # Only if no major penalty already applied
@@ -829,7 +857,7 @@ class NADEHighwayEnv(gym.Env):
         # === SURVIVAL BONUS - Reward for staying alive ===
         # If no penalty was applied (no crash, no off-road), give survival bonus
         if not penalty_applied:
-            survival_bonus = 5  # per timestep for staying safe
+            survival_bonus = 1  # per timestep for staying safe
             reward += survival_bonus
             info['survival_bonus'] = survival_bonus
             
